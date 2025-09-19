@@ -1,0 +1,102 @@
+# -------------------------------------
+# DLT Pipeline: WAKE County Property ETL
+# -------------------------------------
+import sys
+import dlt
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql import DataFrame
+import utilities
+sys.path.append("../utilities")
+from transforms_ETL import TRANSFORM_ETL
+from config import FIELD_DEFAULTS, COLUMN_MAPPING, DEFAULT_FIELD_MAPPING, PADDING_LEN
+import transform_module as tm
+
+#--------------------
+bucket_name = "ss-aws-assessor"
+#--------------------
+# Parcels Clean Table
+# -------------------
+@dlt.table(name="parcels_clean")
+def parcels_clean():
+    df = spark.read.csv(f"s3://{bucket_name}/mm-1/Parcels.csv", header=True, inferSchema=False)
+    df = tm.clean_columns(df)
+    df = tm.clean_strings(df).filter(F.col("PIN") != "")
+    return df.select(
+        "PIN", "CONCATADDR1", "CONCATADDR2", "OWNERNAMEFULL", "OWNERNAME1",
+        "OWNERNAME2", "OWNERADDRESSFULL", "OWNERCITY", "OWNERSTATE", "OWNERZIP", "LEGAL"
+    ).withColumnRenamed("CONCATADDR1", "PROPADD1") \
+     .withColumnRenamed("CONCATADDR2", "PROPADD2")
+
+
+# --------------------------
+# 2_Improvements Clean Table
+# --------------------------
+@dlt.table(name="improvements_clean")
+def improvements_clean():
+    df = spark.read.csv(f"s3://{bucket_name}/mm-1/Improvements.csv", header=True, inferSchema=False)
+    df = tm.clean_columns(df)
+    df = tm.clean_strings(df)
+    return df.select("PIN", "BLD_ID", "ACCOUNTNO", "SF", "YRBLT")
+
+# ---------------------
+# 3_Values Latest Table
+# ---------------------
+@dlt.table(name="values_latest")
+def values_latest():
+    df = spark.read.csv(f"s3://{bucket_name}/mm-1/Values.csv", header=True, inferSchema=False)
+    df = tm.clean_columns(df)
+    df = tm.clean_strings(df)
+
+    # Latest value per PIN
+    window_val = Window.partitionBy("PIN").orderBy(F.col("ACCOUNTNO").desc())
+    df = df.withColumn("FIELD_SEQ", F.row_number().over(window_val))
+    return df.filter(F.col("FIELD_SEQ") == 1) \
+             .select("PIN", "ACCOUNTNO", "ACTLANDVAL", "ACTIMPSVAL", "ACTTOTALVAL",
+                     "ASDLANDVAL", "ASDIMPSVAL", "ASDTOTALVAL")
+
+# -------------------------------------------------------
+# 3. Join All Tables & Apply Field Mappings
+# -------------------------------------------------------
+@dlt.table(name="final_transformed")
+def final_transformed():
+    parcels_df = dlt.read("parcels_clean")
+    improvements_df = dlt.read("improvements_clean")
+    values_df = dlt.read("values_latest")
+    sales_df = dlt.read("sales_latest")
+
+    # Join all sources
+    df_joined = parcels_df.alias("a") \
+        .join(improvements_df.alias("b"), F.col("a.PIN") == F.col("b.PIN"), "left") \
+        .join(values_df.alias("c"), F.col("b.PIN") == F.col("c.PIN"), "left") \
+        .join(sales_df.alias("d"), F.col("a.PIN") == F.col("d.PIN"), "left")
+
+    df_selected = df_joined.select([
+        (F.trim(F.col(f"{alias}.{col}")) if col == "PIN" else F.col(f"{alias}.{col}")).alias(target)
+        for alias, cols in COLUMN_MAPPING.items()
+        for col, target in cols.items()
+    ])
+
+    # Add LAN_SEQ
+    window_bld = Window.partitionBy("PIN").orderBy("PIN", "BLD_ID")
+    df_selected = df_selected.withColumn("LAN_SEQ", F.row_number().over(window_bld))
+
+    # Clean strings and apply final UDF-free transformation
+    df_selected = tm.clean_strings(df_selected)
+    df_selected = TRANSFORM_ETL(
+        df_selected,
+        propadd1_col="B13_PROPADD1",
+        propadd2_col="B13_PROPADD2",
+        ownername2_col="B19_OWNERNAME2",
+        legal_col="B69_LEGAL"
+    )
+    df_selected = tm.populate_F18(df_selected, "B18_OWNERNAME1", "B19_OWNERNAME2")
+    df_selected = tm.populate_F19(df_selected, "B19_OWNERNAME2")
+    df_selected = tm.populate_F22(df_selected, "B18_OWNERNAME1", "B19_OWNERNAME2")
+    df_selected = tm.populate_F33_F34(df_selected, "B33_OWNERZIP", "")
+
+    # Apply zero-padding
+    df_final = tm.pad_dict(df_final, PADDING_LEN)
+    df_final = tm.clean_strings(df_final)
+
+    return df_final
